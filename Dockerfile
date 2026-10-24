@@ -20,19 +20,22 @@ RUN wget -q https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.s
 ENV PATH=/opt/miniconda3/bin:$PATH
 
 RUN conda create -y -n v2d python=3.10 \
-    && /opt/miniconda3/envs/v2d/bin/pip install --no-cache-dir --upgrade pip \
-    # ВАЖНО: torch pin + строго первым (иначе basicsr при sdist-сборке тянет
-    # свежий torch 2.9 + CUDA 12.6/12.9 — +2.6 ГБ и десятки минут сборки).
-    && /opt/miniconda3/envs/v2d/bin/pip install --no-cache-dir \
-        torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cu121 \
-    # Пин diffusers: новее требует torch.accelerator (нет в 2.5.1)
-    && /opt/miniconda3/envs/v2d/bin/pip install --no-cache-dir \
+    && /opt/miniconda3/envs/v2d/bin/pip install --no-cache-dir --upgrade pip
+
+# ВАЖНО: torch pin + строго первым (иначе basicsr при sdist-сборке тянет
+# свежий torch 2.9 + CUDA 12.6/12.9 — +2.6 ГБ и десятки минут сборки).
+RUN /opt/miniconda3/envs/v2d/bin/pip install --no-cache-dir \
+        torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cu121
+
+# Пин diffusers: новее требует torch.accelerator (нет в 2.5.1)
+RUN /opt/miniconda3/envs/v2d/bin/pip install --no-cache-dir \
         opencv-python-headless numpy scipy pillow tqdm \
         "diffusers==0.31.0" "transformers==4.46.3" "accelerate==1.1.1" \
-        "huggingface_hub==0.26.5" safetensors \
-    # basicsr/realesrgan: sdist => обязательно --no-build-isolation,
-    # иначе изолятор сборки ставит СВЕЖИЙ torch с полным CUDA-стеком
-    && /opt/miniconda3/envs/v2d/bin/pip install --no-cache-dir --no-build-isolation \
+        "huggingface_hub==0.26.5" safetensors
+
+# basicsr/realesrgan: sdist => обязательно --no-build-isolation,
+# иначе изолятор сборки ставит СВЕЖИЙ torch с полным CUDA-стеком
+RUN /opt/miniconda3/envs/v2d/bin/pip install --no-cache-dir --no-build-isolation \
         "basicsr==1.4.2" "realesrgan==0.3.0"
 
 # Патч basicsr 1.4.2 под torchvision >= 0.17 (functional_tensor удалён)
