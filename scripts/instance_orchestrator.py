@@ -34,6 +34,22 @@ DEFAULT_KEY = os.path.expanduser("~/.ssh/id_ed25519")
 SPEED_TEST_REMOTE = "/workspace/scripts/speed-test.sh"
 
 
+def load_servers_env(path: str = "env/servers.env") -> dict:
+    """Читает KEY=VALUE из env/servers.env (НЕ коммитится; хосты/порты не светим
+    в командах и stdout — guardrails скрывают IP/хосты)."""
+    out = {}
+    try:
+        for line in open(path):
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            out[k.strip()] = v.strip()
+    except FileNotFoundError:
+        pass
+    return out
+
+
 async def connect(host: str, port: int, user: str = "root",
                   key: str = DEFAULT_KEY, retries: int = 3,
                   retry_delay: float = 10.0) -> asyncssh.SSHClientConnection:
@@ -108,7 +124,7 @@ async def cmd_probe(args: argparse.Namespace) -> int:
     try:
         # 1) гарантируем наличие speed-test.sh (в полном образе уже есть;
         #    на голом инстансе — заливаем SFTP)
-        async with conn.start_sftp() as sftp:
+        async with conn.start_sftp_client() as sftp:
             try:
                 await sftp.stat(SPEED_TEST_REMOTE)
             except asyncssh.SFTPNoSuchFile:
@@ -158,9 +174,11 @@ def main() -> None:
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     def common(p):
-        p.add_argument("--host", required=True)
-        p.add_argument("--port", type=int, required=True)
-        p.add_argument("--user", default="root")
+        # хост/порт из env/servers.env (дефолт) — в консоль/логи не светить
+        _env = load_servers_env()
+        p.add_argument("--host", default=_env.get("REMOTE_HOST"))
+        p.add_argument("--port", type=int, default=int(_env.get("REMOTE_PORT", 0) or 0))
+        p.add_argument("--user", default=_env.get("REMOTE_USER", "root"))
         p.add_argument("--retries", type=int, default=3)
 
     p = sub.add_parser("probe", help="факт-конфиг + скорость канала")
