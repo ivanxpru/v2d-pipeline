@@ -9,12 +9,17 @@
 #   bash /workspace/scripts/speed-test.sh [MIN_MBPS]
 #   MIN_MBPS — порог приёма, по умолчанию 5 МБ/с (гигабит-класс).
 #   Коды выхода: 0 = канал OK, 1 = медленно (ГАСИТЬ инстанс), 2 = GPU/CUDA не ОК.
+#   Флаг-опция до порога: REAL=1 bash speed-test.sh — только факт-конфиг,
+#   без замера сети (для оценки «стоит ли вообще работать»).
 #
-# Что меряется (по 20 с каждый, параллельно не гоняем — нужен честный канал):
-#   1) download.pytorch.org — откуда качается torch (~800 МБ, главный груз)
-#   2) huggingface.co       — веса моделей (HF CDN, xet)
-#   3) files.pythonhosted.org — pip-пакеты
-#   4) DagsHub S3 (если есть /workspace/.s3env) — промежуточное хранилище
+# Платформа Qudata показывает в оффере конфиг ФИЗИЧЕСКОГО ХОСТА, а не контейнера
+# (проверено 2026-10-30: «35 ГБ RAM» в оффере = 503 ГБ по факту; «192 ядра» = 13
+# vCPU по cgroup). Поэтому все параметры меряем изнутри: cgroup-квоты, df, /proc.
+#
+# Что меряется:
+#   [ФАКТ] vCPU (cgroup), RAM (cgroup+free), диск (df), GPU (nvidia-smi)
+#   [КАНАЛ] по 20с каждый: pytorch CDN, HF, PyPI, DagsHub S3
+# Решение «работать / гасить» — по каналу и факт-конфигу.
 set -euo pipefail
 
 MIN_MBPS="${1:-5}"
@@ -31,6 +36,61 @@ measure() {
 }
 
 echo "=== Порог приёма: ${MIN_MBPS} МБ/с, замер по ${TEST_SECONDS}с ==="
+
+# ---------- 0. ФАКТ-конфигурация контейнера (платформа показывает хост!) ----------
+echo "=== Факт-конфигурация контейнера ==="
+# vCPU: cgroup v2/v1 — единственная правда
+VCPU=unknown
+if [ -s /sys/fs/cgroup/cpu.max ]; then
+    read -r QUA PER < /sys/fs/cgroup/cpu.max
+    [ "$QUA" != "max" ] && VCPU=$(( QUA / PER ))
+fi
+[ "$VCPU" = unknown ] && {
+    QUA=$(cat /sys/fs/cgroup/cpu/cpu.cfs_quota_us 2>/dev/null || echo -1)
+    PER=$(cat /sys/fs/cgroup/cpu/cpu.cfs_period_us 2>/dev/null || echo 100000)
+    [ "${QUA:-0}" -gt 0 ] 2>/dev/null && VCPU=$(( QUA / PER ))
+}
+[ "$VCPU" = unknown ] && VCPU=$(nproc)
+echo "vCPU (cgroup):  ${VCPU}"   # оффер обычно показывает ядра хоста — не верить
+
+# RAM: cgroup лимит vs host
+RAM_CGROUP=unknown
+if [ -s /sys/fs/cgroup/memory.max ]; then
+    M=$(cat /sys/fs/cgroup/memory.max 2>/dev/null || echo max)
+    [ "$M" != "max" ] && RAM_CGROUP=$(( M / 1073741824 ))
+fi
+[ "$RAM_CGROUP" = unknown ] && {
+    M=$(cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null || echo max)
+    [ "${M:-max}" != "max" ] && [ "$M" -lt 9000000000000 ] 2>/dev/null && RAM_CGROUP=$(( M / 1073741824 ))
+}
+RAM_FREE=$(free -g 2>/dev/null | awk '/^Mem:/{print $2}')
+echo "RAM cgroup:     ${RAM_CGROUP} ГБ (host по free: ${RAM_FREE} ГБ)"  # LESSER из двух = реальный лимит
+
+# Диск: реальные маунты (overlay = контейнер, /workspace может быть volume)
+df -h / /workspace 2>/dev/null | awk 'NR==1 || /overlay|workspace/'
+DISK_FREE=$(df -BG --output=avail /workspace 2>/dev/null | tail -1 | tr -dc 0-9)
+echo "Диск /workspace свободно: ${DISK_FREE:-?} ГБ"
+
+# GPU
+if nvidia-smi >/dev/null 2>&1; then
+    nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
+else
+    echo "ОШИБКА: nvidia-smi недоступен"
+    exit 2
+fi
+
+# Оценка «стоит ли работать»:
+#   диск < 40 ГБ свободно — впритык (веса уже в образе, но depth-карты жрут много:
+#   2K x 6min = ~50 ГБ raw+smoothed), RAM < 8 ГБ — стек карт в память не влезет.
+if [ "${DISK_FREE:-0}" -lt 40 ]; then
+    echo "ПРЕДУПРЕЖДЕНИЕ: < 40 ГБ на /workspace — картам глубины может не хватить"
+fi
+
+# ---------- Быстрый режим: только факт, без замера канала ----------
+if [ "${REAL:-0}" = "1" ]; then
+    echo "=== REAL-режим: факт-конфигурация выведена, сеть не мерилась ==="
+    exit 0
+fi
 
 # ---------- 1. PyTorch CDN (torch cu121 ~800 МБ) ----------
 S=$(measure "https://download.pytorch.org/whl/cu121/torch-2.4.1%2Bcu121-cp310-cp310-linux_x86_64.whl" "torch")
@@ -72,14 +132,7 @@ else
     echo "DagsHub S3: /workspace/.s3env нет — пропущено (крайне рекомендую прогнать env-up ДО решения о заезде)"
 fi
 
-# ---------- 5. GPU sanity ----------
-if nvidia-smi >/dev/null 2>&1; then
-    nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
-    python3 -c "import torch; assert torch.cuda.is_available(); print('CUDA OK:', torch.cuda.get_device_name(0))" || FAIL=2
-else
-    echo "ОШИБКА: nvidia-smi недоступен"
-    FAIL=2
-fi
+# ---------- 5. GPU sanity уже проверен выше (0) ----------
 
 echo
 if [ "$FAIL" -eq 0 ]; then
